@@ -1,4 +1,8 @@
 // ignore_for_file: public_member_api_docs, sort_constructors_first
+
+/// Pdfrx API
+library;
+
 import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
@@ -7,7 +11,7 @@ import 'package:collection/collection.dart';
 import 'package:http/http.dart' as http;
 import 'package:vector_math/vector_math_64.dart' hide Colors;
 
-import './mock/pdfrx_mock.dart' if (dart.library.io) './native/pdfrx_pdfium.dart';
+import 'native/pdfrx_pdfium.dart';
 import 'utils/unmodifiable_list.dart';
 
 /// Class to provide Pdfrx's configuration.
@@ -23,6 +27,7 @@ class Pdfrx {
 
   /// Font paths scanned by pdfium if supported.
   ///
+  /// It should be set before calling any Pdfrx's functions.
   /// It is not supported on Flutter Web.
   static final fontPaths = <String>[];
 
@@ -62,8 +67,8 @@ class Pdfrx {
   static FutureOr<String> Function()? getCacheDirectory;
 }
 
-abstract class PdfDocumentFactory {
-  static PdfDocumentFactory instance = PdfDocumentFactoryImpl();
+abstract class PdfrxEntryFunctions {
+  static PdfrxEntryFunctions instance = PdfrxEntryFunctionsImpl();
 
   Future<PdfDocument> openAsset(
     String name, {
@@ -110,6 +115,12 @@ abstract class PdfDocumentFactory {
     Map<String, String>? headers,
     bool withCredentials = false,
   });
+
+  Future<void> reloadFonts();
+
+  Future<void> addFontData({required String face, required Uint8List data});
+
+  Future<void> clearAllFontData();
 }
 
 /// Callback function to notify download progress.
@@ -174,7 +185,7 @@ abstract class PdfDocument {
     PdfPasswordProvider? passwordProvider,
     bool firstAttemptByEmptyPassword = true,
     bool useProgressiveLoading = false,
-  }) => PdfDocumentFactory.instance.openFile(
+  }) => PdfrxEntryFunctions.instance.openFile(
     filePath,
     passwordProvider: passwordProvider,
     firstAttemptByEmptyPassword: firstAttemptByEmptyPassword,
@@ -195,7 +206,7 @@ abstract class PdfDocument {
     PdfPasswordProvider? passwordProvider,
     bool firstAttemptByEmptyPassword = true,
     bool useProgressiveLoading = false,
-  }) => PdfDocumentFactory.instance.openAsset(
+  }) => PdfrxEntryFunctions.instance.openAsset(
     name,
     passwordProvider: passwordProvider,
     firstAttemptByEmptyPassword: firstAttemptByEmptyPassword,
@@ -225,7 +236,7 @@ abstract class PdfDocument {
     String? sourceName,
     bool allowDataOwnershipTransfer = false,
     void Function()? onDispose,
-  }) => PdfDocumentFactory.instance.openData(
+  }) => PdfrxEntryFunctions.instance.openData(
     data,
     passwordProvider: passwordProvider,
     firstAttemptByEmptyPassword: firstAttemptByEmptyPassword,
@@ -263,7 +274,7 @@ abstract class PdfDocument {
     bool useProgressiveLoading = false,
     int? maxSizeToCacheOnMemory,
     void Function()? onDispose,
-  }) => PdfDocumentFactory.instance.openCustom(
+  }) => PdfrxEntryFunctions.instance.openCustom(
     read: read,
     fileSize: fileSize,
     sourceName: sourceName,
@@ -305,7 +316,7 @@ abstract class PdfDocument {
     bool preferRangeAccess = false,
     Map<String, String>? headers,
     bool withCredentials = false,
-  }) => PdfDocumentFactory.instance.openUri(
+  }) => PdfrxEntryFunctions.instance.openUri(
     uri,
     passwordProvider: passwordProvider,
     firstAttemptByEmptyPassword: firstAttemptByEmptyPassword,
@@ -349,6 +360,7 @@ typedef PdfPageLoadingCallback<T> = FutureOr<bool> Function(int currentPageNumbe
 enum PdfDocumentEventType {
   /// [PdfDocumentPageStatusChangedEvent]: Page status changed.
   pageStatusChanged,
+  missingFonts, // [PdfDocumentMissingFontsEvent]: Missing fonts changed.
 }
 
 /// Base class for PDF document events.
@@ -372,6 +384,20 @@ class PdfDocumentPageStatusChangedEvent implements PdfDocumentEvent {
 
   /// The pages that have changed.
   final List<PdfPage> pages;
+}
+
+/// Event that is triggered when the list of missing fonts in the PDF document has changed.
+class PdfDocumentMissingFontsEvent implements PdfDocumentEvent {
+  PdfDocumentMissingFontsEvent(this.document, this.missingFonts);
+
+  @override
+  PdfDocumentEventType get type => PdfDocumentEventType.missingFonts;
+
+  @override
+  final PdfDocument document;
+
+  /// The list of missing fonts.
+  final List<PdfFontQuery> missingFonts;
 }
 
 /// Handles a PDF page in [PdfDocument].
@@ -620,6 +646,12 @@ abstract class PdfPage {
       handleLine(lineStart, inputFullText.length);
     }
 
+    if (rotation.index != 0) {
+      for (int i = 0; i < outputCharRects.length; i++) {
+        outputCharRects[i] = outputCharRects[i].rotateReverse(rotation.index, this);
+      }
+    }
+
     final fragments = <PdfPageTextFragment>[];
     final text = PdfPageText(
       pageNumber: pageNumber,
@@ -653,6 +685,18 @@ abstract class PdfPage {
   Future<PdfPageRawText?> _loadFormattedText() async {
     final inputFullText = await loadText();
     final inputCharRects = await loadTextCharRects();
+
+    if (inputFullText.length != inputCharRects.length) {
+      throw Exception(
+        'Page $pageNumber: Internal Error: text and character rects length mismatch (${inputFullText.length} <=> ${inputCharRects.length})',
+      );
+    }
+
+    if (rotation.index != 0) {
+      for (int i = 0; i < inputCharRects.length; i++) {
+        inputCharRects[i] = inputCharRects[i].rotate(rotation.index, this);
+      }
+    }
 
     final fullText = StringBuffer();
     final charRects = <PdfRect>[];
@@ -691,6 +735,7 @@ abstract class PdfPage {
       fullText.write(inputFullText.substring(prevEnd));
       charRects.addAll(inputCharRects.sublist(prevEnd));
     }
+
     return PdfPageRawText(fullText.toString(), charRects);
   }
 
@@ -1552,7 +1597,7 @@ class PdfPoint {
 
 /// Compares two lists for element-by-element equality.
 ///
-/// **NOTE: This function is copiedd from flutter's `foundation` library to remove dependency to Flutter**
+/// **NOTE: This function is copied from flutter's `foundation` library to remove dependency to Flutter**
 bool _listEquals<T>(List<T>? a, List<T>? b) {
   if (a == null) {
     return b == null;
@@ -1569,4 +1614,86 @@ bool _listEquals<T>(List<T>? a, List<T>? b) {
     }
   }
   return true;
+}
+
+class PdfFontQuery {
+  const PdfFontQuery({
+    required this.face,
+    required this.weight,
+    required this.isItalic,
+    required this.charset,
+    required this.pitchFamily,
+  });
+
+  /// Font face name.
+  final String face;
+
+  /// Font weight.
+  final int weight;
+
+  /// Whether the font is italic.
+  final bool isItalic;
+
+  /// PDFium's charset ID.
+  final PdfFontCharset charset;
+
+  /// Pitch family flags.
+  ///
+  /// It can be any combination of the following values:
+  /// - `fixed` = 1
+  /// - `roman` = 16
+  /// - `script` = 64
+  final int pitchFamily;
+
+  bool get isFixed => (pitchFamily & 1) != 0;
+  bool get isRoman => (pitchFamily & 16) != 0;
+  bool get isScript => (pitchFamily & 64) != 0;
+
+  String _getPitchFamily() {
+    return [if (isFixed) 'fixed', if (isRoman) 'roman', if (isScript) 'script'].join(',');
+  }
+
+  @override
+  String toString() =>
+      'PdfFontQuery(face: "$face", weight: $weight, italic: $isItalic, charset: $charset, pitchFamily: $pitchFamily=[${_getPitchFamily()}])';
+}
+
+/// PDFium font charset ID.
+///
+enum PdfFontCharset {
+  ansi(0),
+  default_(1),
+  symbol(2),
+
+  /// Japanese
+  shiftJis(128),
+
+  /// Korean
+  hangul(129),
+
+  /// Chinese Simplified
+  gb2312(134),
+
+  /// Chinese Traditional
+  chineseBig5(136),
+  greek(161),
+  vietnamese(163),
+  hebrew(177),
+  arabic(178),
+  cyrillic(204),
+  thai(222),
+  easternEuropean(238);
+
+  const PdfFontCharset(this.pdfiumCharsetId);
+
+  /// PDFium's charset ID.
+  final int pdfiumCharsetId;
+
+  static final _value2Enum = {for (final e in PdfFontCharset.values) e.pdfiumCharsetId: e};
+
+  /// Convert PDFium's charset ID to [PdfFontCharset].
+  static PdfFontCharset fromPdfiumCharsetId(int id) => _value2Enum[id]!;
+
+  @override
+  String toString() => '$name($pdfiumCharsetId)';
 }

@@ -7,8 +7,10 @@ import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 import 'package:rxdart/rxdart.dart';
+import 'package:synchronized/extension.dart';
 
 import '../pdfrx_api.dart';
+import 'native_utils.dart';
 import 'pdf_file_cache.dart';
 import 'pdfium_bindings.dart' as pdfium_bindings;
 import 'pdfium_interop.dart';
@@ -38,37 +40,46 @@ DynamicLibrary _getModule() {
 /// Loaded PDFium module.
 final pdfium = pdfium_bindings.pdfium(_getModule());
 
+Directory? _appLocalFontPath;
+
 bool _initialized = false;
 
 /// Initializes PDFium library.
-void _init() {
+Future<void> _init() async {
   if (_initialized) return;
-  using((arena) {
-    final config = arena.allocate<pdfium_bindings.FPDF_LIBRARY_CONFIG>(sizeOf<pdfium_bindings.FPDF_LIBRARY_CONFIG>());
-    config.ref.version = 2;
+  await pdfium.synchronized(() async {
+    if (_initialized) return;
 
-    if (Pdfrx.fontPaths.isNotEmpty) {
-      final fontPathArray = arena.allocate<Pointer<Char>>(sizeOf<Pointer<Char>>() * (Pdfrx.fontPaths.length + 1));
-      for (int i = 0; i < Pdfrx.fontPaths.length; i++) {
-        fontPathArray[i] = Pdfrx.fontPaths[i].toUtf8(arena);
+    _appLocalFontPath = await getCacheDirectory('pdfrx.fonts');
+
+    return using((arena) {
+      final config = arena.allocate<pdfium_bindings.FPDF_LIBRARY_CONFIG>(sizeOf<pdfium_bindings.FPDF_LIBRARY_CONFIG>());
+      config.ref.version = 2;
+
+      final fontPaths = [_appLocalFontPath!.path, ...Pdfrx.fontPaths];
+      if (fontPaths.isNotEmpty) {
+        final fontPathArray = arena.allocate<Pointer<Char>>(sizeOf<Pointer<Char>>() * (fontPaths.length + 1));
+        for (int i = 0; i < fontPaths.length; i++) {
+          fontPathArray[i] = fontPaths[i].toUtf8(arena);
+        }
+        fontPathArray[fontPaths.length] = nullptr;
+        config.ref.m_pUserFontPaths = fontPathArray;
+      } else {
+        config.ref.m_pUserFontPaths = nullptr;
       }
-      fontPathArray[Pdfrx.fontPaths.length] = nullptr;
-      config.ref.m_pUserFontPaths = fontPathArray;
-    } else {
-      config.ref.m_pUserFontPaths = nullptr;
-    }
 
-    config.ref.m_pIsolate = nullptr;
-    config.ref.m_v8EmbedderSlot = 0;
-    pdfium.FPDF_InitLibraryWithConfig(config);
+      config.ref.m_pIsolate = nullptr;
+      config.ref.m_v8EmbedderSlot = 0;
+      pdfium.FPDF_InitLibraryWithConfig(config);
+      _initialized = true;
+    });
   });
-  _initialized = true;
 }
 
 final backgroundWorker = BackgroundWorker.create();
 
-class PdfDocumentFactoryImpl implements PdfDocumentFactory {
-  PdfDocumentFactoryImpl();
+class PdfrxEntryFunctionsImpl implements PdfrxEntryFunctions {
+  PdfrxEntryFunctionsImpl();
 
   @override
   Future<PdfDocument> openAsset(
@@ -117,8 +128,8 @@ class PdfDocumentFactoryImpl implements PdfDocumentFactory {
     PdfPasswordProvider? passwordProvider,
     bool firstAttemptByEmptyPassword = true,
     bool useProgressiveLoading = false,
-  }) {
-    _init();
+  }) async {
+    await _init();
     return _openByFunc(
       (password) async => (await backgroundWorker).computeWithArena((arena, params) {
         final doc = pdfium.FPDF_LoadDocument(params.filePath.toUtf8(arena), params.password?.toUtf8(arena) ?? nullptr);
@@ -172,7 +183,7 @@ class PdfDocumentFactoryImpl implements PdfDocumentFactory {
     int? maxSizeToCacheOnMemory,
     void Function()? onDispose,
   }) async {
-    _init();
+    await _init();
 
     maxSizeToCacheOnMemory ??= 1024 * 1024; // the default is 1MB
 
@@ -300,6 +311,17 @@ class PdfDocumentFactoryImpl implements PdfDocumentFactory {
       throw PdfException('Failed to load PDF document (FPDF_GetLastError=${pdfium.FPDF_GetLastError()}).');
     }
   }
+
+  @override
+  Future<void> reloadFonts() => throw UnimplementedError('FIXME: PdfrxEntryFunctions.reloadFonts is not implemented.');
+
+  @override
+  Future<void> addFontData({required String face, required Uint8List data}) =>
+      throw UnimplementedError('FIXME: PdfrxEntryFunctions.addFontData is not implemented.');
+
+  @override
+  Future<void> clearAllFontData() =>
+      throw UnimplementedError('FIXME: PdfrxEntryFunctions.clearAllFontData is not implemented.');
 }
 
 extension _FpdfUtf8StringExt on String {
@@ -445,14 +467,18 @@ class _PdfDocumentPdfium extends PdfDocument {
                 ? pageCount
                 : min(pageCount, params.pagesCountLoadedSoFar + params.maxPageCountToLoadAdditionally!);
             final t = params.timeoutUs != null ? (Stopwatch()..start()) : null;
-            final pages = <({double width, double height, int rotation})>[];
+            final pages = <({double width, double height, int rotation, double bbLeft, double bbBottom})>[];
             for (int i = params.pagesCountLoadedSoFar; i < end; i++) {
               final page = pdfium.FPDF_LoadPage(doc, i);
               try {
+                final rect = arena.allocate<pdfium_bindings.FS_RECTF>(sizeOf<pdfium_bindings.FS_RECTF>());
+                pdfium.FPDF_GetPageBoundingBox(page, rect);
                 pages.add((
                   width: pdfium.FPDF_GetPageWidthF(page),
                   height: pdfium.FPDF_GetPageHeightF(page),
                   rotation: pdfium.FPDFPage_GetRotation(page),
+                  bbLeft: rect.ref.left.toDouble(),
+                  bbBottom: rect.ref.bottom.toDouble(),
                 ));
               } finally {
                 pdfium.FPDF_ClosePage(page);
@@ -482,6 +508,8 @@ class _PdfDocumentPdfium extends PdfDocument {
             width: pageData.width,
             height: pageData.height,
             rotation: PdfPageRotation.values[pageData.rotation],
+            bbLeft: pageData.bbLeft,
+            bbBottom: pageData.bbBottom,
             isLoaded: true,
           ),
         );
@@ -497,6 +525,8 @@ class _PdfDocumentPdfium extends PdfDocument {
               width: last.width,
               height: last.height,
               rotation: last.rotation,
+              bbLeft: last.bbLeft,
+              bbBottom: last.bbBottom,
               isLoaded: false,
             ),
           );
@@ -580,6 +610,12 @@ class _PdfPagePdfium extends PdfPage {
   @override
   final double height;
 
+  /// Bounding box left
+  final double bbLeft;
+
+  /// Bounding box bottom
+  final double bbBottom;
+
   @override
   final PdfPageRotation rotation;
 
@@ -592,6 +628,8 @@ class _PdfPagePdfium extends PdfPage {
     required this.width,
     required this.height,
     required this.rotation,
+    required this.bbLeft,
+    required this.bbBottom,
     required this.isLoaded,
   });
 
@@ -786,7 +824,7 @@ class _PdfPagePdfium extends PdfPage {
               rectBuffer.offset(doubleSize * 3), // B
               rectBuffer.offset(doubleSize), // T
             );
-            charRects.add(_rectFromLTRBBuffer(rectBuffer));
+            charRects.add(_rectFromLTRBBuffer(rectBuffer, params.bbLeft, params.bbBottom));
           }
           return charRects;
         } finally {
@@ -794,7 +832,7 @@ class _PdfPagePdfium extends PdfPage {
           pdfium.FPDF_ClosePage(page);
         }
       }),
-      (docHandle: document.document.address, pageNumber: pageNumber),
+      (docHandle: document.document.address, pageNumber: pageNumber, bbLeft: bbLeft, bbBottom: bbBottom),
     );
   }
 
@@ -840,7 +878,7 @@ class _PdfPagePdfium extends PdfPage {
                     rectBuffer.offset(doubleSize * 2),
                     rectBuffer.offset(doubleSize * 3),
                   );
-                  return _rectFromLTRBBuffer(rectBuffer);
+                  return _rectFromLTRBBuffer(rectBuffer, params.bbLeft, params.bbBottom);
                 });
                 return PdfLink(rects, url: Uri.tryParse(_getLinkUrl(linkPage, index, arena)));
               });
@@ -850,7 +888,7 @@ class _PdfPagePdfium extends PdfPage {
             pdfium.FPDFText_ClosePage(textPage);
             pdfium.FPDF_ClosePage(page);
           }
-        }, (document: document.document.address, pageNumber: pageNumber));
+        }, (document: document.document.address, pageNumber: pageNumber, bbLeft: bbLeft, bbBottom: bbBottom));
 
   static String _getLinkUrl(pdfium_bindings.FPDF_PAGELINK linkPage, int linkIndex, Arena arena) {
     final urlLength = pdfium.FPDFLink_GetURL(linkPage, linkIndex, nullptr, 0);
@@ -942,6 +980,14 @@ class _PdfPagePdfium extends PdfPage {
         return null;
     }
   }
+
+  static PdfRect _rectFromLTRBBuffer(Pointer<Double> buffer, double bbLeft, double bbBottom) {
+    final left = buffer[0] - bbLeft;
+    final top = buffer[1] - bbBottom;
+    final right = buffer[2] - bbLeft;
+    final bottom = buffer[3] - bbBottom;
+    return PdfRect(left, top, right, bottom);
+  }
 }
 
 class PdfPageRenderCancellationTokenPdfium extends PdfPageRenderCancellationToken {
@@ -988,8 +1034,6 @@ class _PdfImagePdfium extends PdfImage {
     malloc.free(_buffer);
   }
 }
-
-PdfRect _rectFromLTRBBuffer(Pointer<Double> buffer) => PdfRect(buffer[0], buffer[1], buffer[2], buffer[3]);
 
 extension _PointerExt<T extends NativeType> on Pointer<T> {
   Pointer<T> offset(int offsetInBytes) => Pointer.fromAddress(address + offsetInBytes);
